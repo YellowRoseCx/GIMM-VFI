@@ -20,9 +20,7 @@ from functools import partial
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import Mlp, DropPath, to_2tuple, trunc_normal_
-from timm.models.registry import register_model
 from timm.models.vision_transformer import Attention
-from timm.models.helpers import build_model_with_cfg, overlay_external_default_cfg
 from .attention import MultiHeadAttention, LinearPositionEmbeddingSine
 from ...utils.utils import coords_grid, bilinear_sampler, upflow8
 
@@ -196,10 +194,8 @@ class GroupAttnRPEContext(nn.Module):
             B, _h * _w, self.ws * self.ws, self.num_heads, C // self.num_heads
         ).permute(0, 1, 3, 2, 4)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        attn = (attn @ v).transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
@@ -315,10 +311,8 @@ class GroupAttnRPE(nn.Module):
             B, _h * _w, self.ws * self.ws, self.num_heads, C // self.num_heads
         ).permute(0, 1, 3, 2, 4)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        attn = (attn @ v).transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
@@ -414,10 +408,8 @@ class LocallyGroupedAttnRPEContext(nn.Module):
             )
             .permute(3, 0, 1, 4, 2, 5)[0]
         )
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        attn = (attn @ v).transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
@@ -531,11 +523,9 @@ class GlobalSubSampleAttnRPEContext(nn.Module):
             .permute(0, 2, 1, 3)
         )
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, Hp, Wp, C)
+        x = attn.transpose(1, 2).reshape(B, Hp, Wp, C)
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
 
@@ -614,10 +604,8 @@ class LocallyGroupedAttnRPE(nn.Module):
             )
             .permute(3, 0, 1, 4, 2, 5)[0]
         )
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        attn = (attn @ v).transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
@@ -712,11 +700,9 @@ class GlobalSubSampleAttnRPE(nn.Module):
             .permute(0, 2, 1, 3)
         )
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, Hp, Wp, C)
+        x = attn.transpose(1, 2).reshape(B, Hp, Wp, C)
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
 
@@ -800,11 +786,9 @@ class CrossGlobalSubSampleAttnRPE(nn.Module):
             .permute(0, 2, 1, 3)
         )
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = attn.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -854,10 +838,8 @@ class LocallyGroupedAttn(nn.Module):
             .permute(3, 0, 1, 4, 2, 5)
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        attn = (attn @ v).transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
@@ -914,11 +896,9 @@ class GlobalSubSampleAttn(nn.Module):
         )
         k, v = kv[0], kv[1]
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = attn.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -972,11 +952,9 @@ class CrossGlobalSubSampleAttn(nn.Module):
         )
         k, v = kv[0], kv[1]
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = attn.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
