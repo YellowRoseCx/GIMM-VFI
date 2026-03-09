@@ -10,20 +10,24 @@ def _triton_corr_forward_kernel(
     b_stride_co, c_stride_co, h_stride_co, w_stride_co,
     b_stride_out, d_stride_out, h_stride_out, w_stride_out,
     B, C, H1, W1, H2, W2, r, rd,
+    BLOCK_SIZE_HW: tl.constexpr,
     BLOCK_SIZE_C: tl.constexpr
 ):
     pid_b = tl.program_id(0)
-    pid_hw = tl.program_id(1)
+    pid_hw_block = tl.program_id(1)
 
-    h1 = pid_hw // W1
-    w1 = pid_hw % W1
+    hw_offsets = pid_hw_block * BLOCK_SIZE_HW + tl.arange(0, BLOCK_SIZE_HW)
+    hw_mask = hw_offsets < H1 * W1
+
+    h1 = hw_offsets // W1
+    w1 = hw_offsets % W1
 
     # Load coordinates
     coord_x_ptr = coords_ptr + pid_b * b_stride_co + 0 * c_stride_co + h1 * h_stride_co + w1 * w_stride_co
     coord_y_ptr = coords_ptr + pid_b * b_stride_co + 1 * c_stride_co + h1 * h_stride_co + w1 * w_stride_co
 
-    x = tl.load(coord_x_ptr)
-    y = tl.load(coord_y_ptr)
+    x = tl.load(coord_x_ptr, mask=hw_mask, other=0.0)
+    y = tl.load(coord_y_ptr, mask=hw_mask, other=0.0)
 
     # math.floor in triton
     x_floor = tl.math.floor(x)
@@ -38,65 +42,64 @@ def _triton_corr_forward_kernel(
     c_offsets = tl.arange(0, BLOCK_SIZE_C)
     c_mask = c_offsets < C
 
-    # Load fmap1 feature vector for this pixel
-    f1_ptrs = fmap1_ptr + pid_b * b_stride_f1 + h1 * h_stride_f1 + w1 * w_stride_f1 + c_offsets * c_stride_f1
-    f1 = tl.load(f1_ptrs, mask=c_mask, other=0.0)
+    # 2D mask for [BLOCK_SIZE_HW, BLOCK_SIZE_C]
+    mask_2d = hw_mask[:, None] & c_mask[None, :]
+
+    # Load fmap1 feature vector for these pixels
+    f1_ptrs = fmap1_ptr + pid_b * b_stride_f1 + h1[:, None] * h_stride_f1 + w1[:, None] * w_stride_f1 + c_offsets[None, :] * c_stride_f1
+    f1 = tl.load(f1_ptrs, mask=mask_2d, other=0.0)
 
     for iy_out in range(rd):
         for ix_out in range(rd):
-            # Compute destination index in cost volume (iy_out + rd * ix_out)
-            # The original scatter logic writes differently, but maps perfectly to this gather logic:
-
             # The 4 points to gather from:
-            # nw: h2 = y0 - r + iy_out + 1, w2 = x0 - r + ix_out + 1
-            # ne: h2 = y0 - r + iy_out + 1, w2 = x0 - r + ix_out
-            # sw: h2 = y0 - r + iy_out,     w2 = x0 - r + ix_out + 1
-            # se: h2 = y0 - r + iy_out,     w2 = x0 - r + ix_out
-
             h2_sw_se = y0 - r + iy_out
             h2_nw_ne = y0 - r + iy_out + 1
 
             w2_ne_se = x0 - r + ix_out
             w2_nw_sw = x0 - r + ix_out + 1
 
-            val = 0.0
+            val = tl.zeros([BLOCK_SIZE_HW], dtype=tl.float32)
 
             # nw
             mask_nw = (h2_nw_ne >= 0) & (h2_nw_ne < H2) & (w2_nw_sw >= 0) & (w2_nw_sw < W2)
-            if mask_nw:
-                f2_ptrs_nw = fmap2_ptr + pid_b * b_stride_f2 + h2_nw_ne * h_stride_f2 + w2_nw_sw * w_stride_f2 + c_offsets * c_stride_f2
-                f2_nw = tl.load(f2_ptrs_nw, mask=c_mask, other=0.0)
-                s_nw = tl.sum(f1 * f2_nw)
-                val += s_nw * dy * dx
+            mask_nw_2d = mask_nw[:, None] & mask_2d
+
+            f2_ptrs_nw = fmap2_ptr + pid_b * b_stride_f2 + h2_nw_ne[:, None] * h_stride_f2 + w2_nw_sw[:, None] * w_stride_f2 + c_offsets[None, :] * c_stride_f2
+            f2_nw = tl.load(f2_ptrs_nw, mask=mask_nw_2d, other=0.0)
+            s_nw = tl.sum(f1 * f2_nw, axis=1)
+            val += tl.where(mask_nw, s_nw * dy * dx, 0.0)
 
             # ne
             mask_ne = (h2_nw_ne >= 0) & (h2_nw_ne < H2) & (w2_ne_se >= 0) & (w2_ne_se < W2)
-            if mask_ne:
-                f2_ptrs_ne = fmap2_ptr + pid_b * b_stride_f2 + h2_nw_ne * h_stride_f2 + w2_ne_se * w_stride_f2 + c_offsets * c_stride_f2
-                f2_ne = tl.load(f2_ptrs_ne, mask=c_mask, other=0.0)
-                s_ne = tl.sum(f1 * f2_ne)
-                val += s_ne * dy * (1.0 - dx)
+            mask_ne_2d = mask_ne[:, None] & mask_2d
+
+            f2_ptrs_ne = fmap2_ptr + pid_b * b_stride_f2 + h2_nw_ne[:, None] * h_stride_f2 + w2_ne_se[:, None] * w_stride_f2 + c_offsets[None, :] * c_stride_f2
+            f2_ne = tl.load(f2_ptrs_ne, mask=mask_ne_2d, other=0.0)
+            s_ne = tl.sum(f1 * f2_ne, axis=1)
+            val += tl.where(mask_ne, s_ne * dy * (1.0 - dx), 0.0)
 
             # sw
             mask_sw = (h2_sw_se >= 0) & (h2_sw_se < H2) & (w2_nw_sw >= 0) & (w2_nw_sw < W2)
-            if mask_sw:
-                f2_ptrs_sw = fmap2_ptr + pid_b * b_stride_f2 + h2_sw_se * h_stride_f2 + w2_nw_sw * w_stride_f2 + c_offsets * c_stride_f2
-                f2_sw = tl.load(f2_ptrs_sw, mask=c_mask, other=0.0)
-                s_sw = tl.sum(f1 * f2_sw)
-                val += s_sw * (1.0 - dy) * dx
+            mask_sw_2d = mask_sw[:, None] & mask_2d
+
+            f2_ptrs_sw = fmap2_ptr + pid_b * b_stride_f2 + h2_sw_se[:, None] * h_stride_f2 + w2_nw_sw[:, None] * w_stride_f2 + c_offsets[None, :] * c_stride_f2
+            f2_sw = tl.load(f2_ptrs_sw, mask=mask_sw_2d, other=0.0)
+            s_sw = tl.sum(f1 * f2_sw, axis=1)
+            val += tl.where(mask_sw, s_sw * (1.0 - dy) * dx, 0.0)
 
             # se
             mask_se = (h2_sw_se >= 0) & (h2_sw_se < H2) & (w2_ne_se >= 0) & (w2_ne_se < W2)
-            if mask_se:
-                f2_ptrs_se = fmap2_ptr + pid_b * b_stride_f2 + h2_sw_se * h_stride_f2 + w2_ne_se * w_stride_f2 + c_offsets * c_stride_f2
-                f2_se = tl.load(f2_ptrs_se, mask=c_mask, other=0.0)
-                s_se = tl.sum(f1 * f2_se)
-                val += s_se * (1.0 - dy) * (1.0 - dx)
+            mask_se_2d = mask_se[:, None] & mask_2d
+
+            f2_ptrs_se = fmap2_ptr + pid_b * b_stride_f2 + h2_sw_se[:, None] * h_stride_f2 + w2_ne_se[:, None] * w_stride_f2 + c_offsets[None, :] * c_stride_f2
+            f2_se = tl.load(f2_ptrs_se, mask=mask_se_2d, other=0.0)
+            s_se = tl.sum(f1 * f2_se, axis=1)
+            val += tl.where(mask_se, s_se * (1.0 - dy) * (1.0 - dx), 0.0)
 
             # Write to output
             out_idx = iy_out + rd * ix_out
             out_ptr = corr_ptr + pid_b * b_stride_out + out_idx * d_stride_out + h1 * h_stride_out + w1 * w_stride_out
-            tl.store(out_ptr, val)
+            tl.store(out_ptr, val, mask=hw_mask)
 
 def triton_corr_forward(fmap1, fmap2, coords, r):
     # fmap1: [B, C, H1, W1]
@@ -113,7 +116,8 @@ def triton_corr_forward(fmap1, fmap2, coords, r):
 
     corr = torch.empty((B, rd * rd, H1, W1), device=fmap1.device, dtype=fmap1.dtype)
 
-    grid = (B, H1 * W1)
+    BLOCK_SIZE_HW = 64
+    grid = (B, triton.cdiv(H1 * W1, BLOCK_SIZE_HW))
 
     # Find next power of 2 for channels block size to ensure we can load it all at once efficiently
     BLOCK_SIZE_C = triton.next_power_of_2(C)
@@ -125,6 +129,7 @@ def triton_corr_forward(fmap1, fmap2, coords, r):
         coords.stride(0), coords.stride(1), coords.stride(2), coords.stride(3),
         corr.stride(0), corr.stride(1), corr.stride(2), corr.stride(3),
         B, C, H1, W1, H2, W2, r, rd,
+        BLOCK_SIZE_HW=BLOCK_SIZE_HW,
         BLOCK_SIZE_C=BLOCK_SIZE_C
     )
 
