@@ -89,12 +89,10 @@ class CrossAttentionLayer(nn.Module):
             value = self.v(memory)
 
         # [B, 2, H1, W1] -> [BH1W1, 1, 2]
-        query_coord = query_coord.contiguous()
         query_coord = (
             query_coord.view(B, 2, -1)
             .permute(0, 2, 1)[:, :, None, :]
-            .contiguous()
-            .view(B * H1 * W1, 1, 2)
+            .reshape(B * H1 * W1, 1, 2)
         )
         if self.pe == "linear":
             query_coord_enc = LinearPositionEmbeddingSine(query_coord, dim=self.dim)
@@ -290,8 +288,7 @@ class MemoryDecoder(nn.Module):
             query = self.flow_token_encoder(cost_forward)
             query = (
                 query.permute(0, 2, 3, 1)
-                .contiguous()
-                .view(size[0] * size[2] * size[3], 1, self.dim)
+                .reshape(size[0] * size[2] * size[3], 1, self.dim)
             )
             cost_global, key, value = self.decoder_layer(
                 query, key, value, cost_memory, coords1, size, data["H3W3"]

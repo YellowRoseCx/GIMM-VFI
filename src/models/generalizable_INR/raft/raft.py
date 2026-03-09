@@ -111,9 +111,6 @@ class RAFT(nn.Module):
         image1 = 2 * (image1 / 255.0) - 1.0
         image2 = 2 * (image2 / 255.0) - 1.0
 
-        image1 = image1.contiguous()
-        image2 = image2.contiguous()
-
         hdim = self.hidden_dim
         cdim = self.context_dim
 

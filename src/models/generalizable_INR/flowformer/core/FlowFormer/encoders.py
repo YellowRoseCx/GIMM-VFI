@@ -38,7 +38,7 @@ class twins_svt_large(nn.Module):
                 if j == 0:
                     x = pos_blk(x, size)
             if i < len(self.svt.depths) - 1:
-                x = x.reshape(B, *size, -1).permute(0, 3, 1, 2).contiguous()
+                x = x.reshape(B, *size, -1).permute(0, 3, 1, 2)
             if return_feat:
                 feat.append(x)
             if i == layer - 1:
@@ -100,7 +100,7 @@ class twins_svt_large_context(nn.Module):
                 if j == 0:
                     x = pos_blk(x, size)
             if i < len(self.svt.depths) - 1:
-                x = x.reshape(B, *size, -1).permute(0, 3, 1, 2).contiguous()
+                x = x.reshape(B, *size, -1).permute(0, 3, 1, 2)
 
             if i == layer - 1:
                 break
