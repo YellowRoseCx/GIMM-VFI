@@ -1,13 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-# References:
-# softmax-splatting: https://github.com/sniklaus/softmax-splatting
-# --------------------------------------------------------
-
 import torch
 import triton
 import triton.language as tl
@@ -62,20 +55,30 @@ def softsplat_fwd_kernel(
     offset_in = intN * stride_in_n + intC * stride_in_c + intY * stride_in_h + intX * stride_in_w
     fltIn = tl.load(tenIn_ptr + offset_in, mask=mask, other=0.0)
 
+    # Safe bounds for pointer calculation to avoid AMD HIP illegal memory access
+    safe_NW_X = tl.where(intNorthwestX_int >= 0, tl.where(intNorthwestX_int < W, intNorthwestX_int, W - 1), 0)
+    safe_NW_Y = tl.where(intNorthwestY_int >= 0, tl.where(intNorthwestY_int < H, intNorthwestY_int, H - 1), 0)
+    safe_NE_X = tl.where(intNortheastX_int >= 0, tl.where(intNortheastX_int < W, intNortheastX_int, W - 1), 0)
+    safe_NE_Y = tl.where(intNortheastY_int >= 0, tl.where(intNortheastY_int < H, intNortheastY_int, H - 1), 0)
+    safe_SW_X = tl.where(intSouthwestX_int >= 0, tl.where(intSouthwestX_int < W, intSouthwestX_int, W - 1), 0)
+    safe_SW_Y = tl.where(intSouthwestY_int >= 0, tl.where(intSouthwestY_int < H, intSouthwestY_int, H - 1), 0)
+    safe_SE_X = tl.where(intSoutheastX_int >= 0, tl.where(intSoutheastX_int < W, intSoutheastX_int, W - 1), 0)
+    safe_SE_Y = tl.where(intSoutheastY_int >= 0, tl.where(intSoutheastY_int < H, intSoutheastY_int, H - 1), 0)
+
     maskNW = mask & (intNorthwestX_int >= 0) & (intNorthwestX_int < W) & (intNorthwestY_int >= 0) & (intNorthwestY_int < H)
-    offsetNW = intN * stride_out_n + intC * stride_out_c + intNorthwestY_int * stride_out_h + intNorthwestX_int * stride_out_w
+    offsetNW = intN * stride_out_n + intC * stride_out_c + safe_NW_Y * stride_out_h + safe_NW_X * stride_out_w
     tl.atomic_add(tenOut_ptr + offsetNW, fltIn * fltNorthwest, mask=maskNW)
 
     maskNE = mask & (intNortheastX_int >= 0) & (intNortheastX_int < W) & (intNortheastY_int >= 0) & (intNortheastY_int < H)
-    offsetNE = intN * stride_out_n + intC * stride_out_c + intNortheastY_int * stride_out_h + intNortheastX_int * stride_out_w
+    offsetNE = intN * stride_out_n + intC * stride_out_c + safe_NE_Y * stride_out_h + safe_NE_X * stride_out_w
     tl.atomic_add(tenOut_ptr + offsetNE, fltIn * fltNortheast, mask=maskNE)
 
     maskSW = mask & (intSouthwestX_int >= 0) & (intSouthwestX_int < W) & (intSouthwestY_int >= 0) & (intSouthwestY_int < H)
-    offsetSW = intN * stride_out_n + intC * stride_out_c + intSouthwestY_int * stride_out_h + intSouthwestX_int * stride_out_w
+    offsetSW = intN * stride_out_n + intC * stride_out_c + safe_SW_Y * stride_out_h + safe_SW_X * stride_out_w
     tl.atomic_add(tenOut_ptr + offsetSW, fltIn * fltSouthwest, mask=maskSW)
 
     maskSE = mask & (intSoutheastX_int >= 0) & (intSoutheastX_int < W) & (intSoutheastY_int >= 0) & (intSoutheastY_int < H)
-    offsetSE = intN * stride_out_n + intC * stride_out_c + intSoutheastY_int * stride_out_h + intSoutheastX_int * stride_out_w
+    offsetSE = intN * stride_out_n + intC * stride_out_c + safe_SE_Y * stride_out_h + safe_SE_X * stride_out_w
     tl.atomic_add(tenOut_ptr + offsetSE, fltIn * fltSoutheast, mask=maskSE)
 
 @triton.jit
@@ -128,23 +131,33 @@ def softsplat_bwd_ingrad_kernel(
 
     fltIngrad = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
 
+    # Safe bounds for pointer calculation to avoid AMD HIP illegal memory access
+    safe_NW_X = tl.where(intNorthwestX_int >= 0, tl.where(intNorthwestX_int < W, intNorthwestX_int, W - 1), 0)
+    safe_NW_Y = tl.where(intNorthwestY_int >= 0, tl.where(intNorthwestY_int < H, intNorthwestY_int, H - 1), 0)
+    safe_NE_X = tl.where(intNortheastX_int >= 0, tl.where(intNortheastX_int < W, intNortheastX_int, W - 1), 0)
+    safe_NE_Y = tl.where(intNortheastY_int >= 0, tl.where(intNortheastY_int < H, intNortheastY_int, H - 1), 0)
+    safe_SW_X = tl.where(intSouthwestX_int >= 0, tl.where(intSouthwestX_int < W, intSouthwestX_int, W - 1), 0)
+    safe_SW_Y = tl.where(intSouthwestY_int >= 0, tl.where(intSouthwestY_int < H, intSouthwestY_int, H - 1), 0)
+    safe_SE_X = tl.where(intSoutheastX_int >= 0, tl.where(intSoutheastX_int < W, intSoutheastX_int, W - 1), 0)
+    safe_SE_Y = tl.where(intSoutheastY_int >= 0, tl.where(intSoutheastY_int < H, intSoutheastY_int, H - 1), 0)
+
     maskNW = mask & (intNorthwestX_int >= 0) & (intNorthwestX_int < W) & (intNorthwestY_int >= 0) & (intNorthwestY_int < H)
-    offsetNW = intN * stride_outg_n + intC * stride_outg_c + intNorthwestY_int * stride_outg_h + intNorthwestX_int * stride_outg_w
+    offsetNW = intN * stride_outg_n + intC * stride_outg_c + safe_NW_Y * stride_outg_h + safe_NW_X * stride_outg_w
     outgNW = tl.load(tenOutgrad_ptr + offsetNW, mask=maskNW, other=0.0)
     fltIngrad += outgNW * fltNorthwest
 
     maskNE = mask & (intNortheastX_int >= 0) & (intNortheastX_int < W) & (intNortheastY_int >= 0) & (intNortheastY_int < H)
-    offsetNE = intN * stride_outg_n + intC * stride_outg_c + intNortheastY_int * stride_outg_h + intNortheastX_int * stride_outg_w
+    offsetNE = intN * stride_outg_n + intC * stride_outg_c + safe_NE_Y * stride_outg_h + safe_NE_X * stride_outg_w
     outgNE = tl.load(tenOutgrad_ptr + offsetNE, mask=maskNE, other=0.0)
     fltIngrad += outgNE * fltNortheast
 
     maskSW = mask & (intSouthwestX_int >= 0) & (intSouthwestX_int < W) & (intSouthwestY_int >= 0) & (intSouthwestY_int < H)
-    offsetSW = intN * stride_outg_n + intC * stride_outg_c + intSouthwestY_int * stride_outg_h + intSouthwestX_int * stride_outg_w
+    offsetSW = intN * stride_outg_n + intC * stride_outg_c + safe_SW_Y * stride_outg_h + safe_SW_X * stride_outg_w
     outgSW = tl.load(tenOutgrad_ptr + offsetSW, mask=maskSW, other=0.0)
     fltIngrad += outgSW * fltSouthwest
 
     maskSE = mask & (intSoutheastX_int >= 0) & (intSoutheastX_int < W) & (intSoutheastY_int >= 0) & (intSoutheastY_int < H)
-    offsetSE = intN * stride_outg_n + intC * stride_outg_c + intSoutheastY_int * stride_outg_h + intSoutheastX_int * stride_outg_w
+    offsetSE = intN * stride_outg_n + intC * stride_outg_c + safe_SE_Y * stride_outg_h + safe_SE_X * stride_outg_w
     outgSE = tl.load(tenOutgrad_ptr + offsetSE, mask=maskSE, other=0.0)
     fltIngrad += outgSE * fltSoutheast
 
@@ -194,6 +207,16 @@ def softsplat_bwd_flowgrad_kernel(
     intSoutheastX_int = intNorthwestX_int + 1
     intSoutheastY_int = intNorthwestY_int + 1
 
+    # Safe bounds for pointer calculation to avoid AMD HIP illegal memory access
+    safe_NW_X = tl.where(intNorthwestX_int >= 0, tl.where(intNorthwestX_int < W, intNorthwestX_int, W - 1), 0)
+    safe_NW_Y = tl.where(intNorthwestY_int >= 0, tl.where(intNorthwestY_int < H, intNorthwestY_int, H - 1), 0)
+    safe_NE_X = tl.where(intNortheastX_int >= 0, tl.where(intNortheastX_int < W, intNortheastX_int, W - 1), 0)
+    safe_NE_Y = tl.where(intNortheastY_int >= 0, tl.where(intNortheastY_int < H, intNortheastY_int, H - 1), 0)
+    safe_SW_X = tl.where(intSouthwestX_int >= 0, tl.where(intSouthwestX_int < W, intSouthwestX_int, W - 1), 0)
+    safe_SW_Y = tl.where(intSouthwestY_int >= 0, tl.where(intSouthwestY_int < H, intSouthwestY_int, H - 1), 0)
+    safe_SE_X = tl.where(intSoutheastX_int >= 0, tl.where(intSoutheastX_int < W, intSoutheastX_int, W - 1), 0)
+    safe_SE_Y = tl.where(intSoutheastY_int >= 0, tl.where(intSoutheastY_int < H, intSoutheastY_int, H - 1), 0)
+
     fltNorthwest = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     fltNortheast = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     fltSouthwest = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
@@ -219,22 +242,22 @@ def softsplat_bwd_flowgrad_kernel(
         fltIn = tl.load(tenIn_ptr + offset_in, mask=mask, other=0.0)
 
         maskNW = mask & (intNorthwestX_int >= 0) & (intNorthwestX_int < W) & (intNorthwestY_int >= 0) & (intNorthwestY_int < H)
-        offsetNW = intN * stride_outg_n + intChannel * stride_outg_c + intNorthwestY_int * stride_outg_h + intNorthwestX_int * stride_outg_w
+        offsetNW = intN * stride_outg_n + intChannel * stride_outg_c + safe_NW_Y * stride_outg_h + safe_NW_X * stride_outg_w
         outgNW = tl.load(tenOutgrad_ptr + offsetNW, mask=maskNW, other=0.0)
         fltFlowgrad += outgNW * fltIn * fltNorthwest
 
         maskNE = mask & (intNortheastX_int >= 0) & (intNortheastX_int < W) & (intNortheastY_int >= 0) & (intNortheastY_int < H)
-        offsetNE = intN * stride_outg_n + intChannel * stride_outg_c + intNortheastY_int * stride_outg_h + intNortheastX_int * stride_outg_w
+        offsetNE = intN * stride_outg_n + intChannel * stride_outg_c + safe_NE_Y * stride_outg_h + safe_NE_X * stride_outg_w
         outgNE = tl.load(tenOutgrad_ptr + offsetNE, mask=maskNE, other=0.0)
         fltFlowgrad += outgNE * fltIn * fltNortheast
 
         maskSW = mask & (intSouthwestX_int >= 0) & (intSouthwestX_int < W) & (intSouthwestY_int >= 0) & (intSouthwestY_int < H)
-        offsetSW = intN * stride_outg_n + intChannel * stride_outg_c + intSouthwestY_int * stride_outg_h + intSouthwestX_int * stride_outg_w
+        offsetSW = intN * stride_outg_n + intChannel * stride_outg_c + safe_SW_Y * stride_outg_h + safe_SW_X * stride_outg_w
         outgSW = tl.load(tenOutgrad_ptr + offsetSW, mask=maskSW, other=0.0)
         fltFlowgrad += outgSW * fltIn * fltSouthwest
 
         maskSE = mask & (intSoutheastX_int >= 0) & (intSoutheastX_int < W) & (intSoutheastY_int >= 0) & (intSoutheastY_int < H)
-        offsetSE = intN * stride_outg_n + intChannel * stride_outg_c + intSoutheastY_int * stride_outg_h + intSoutheastX_int * stride_outg_w
+        offsetSE = intN * stride_outg_n + intChannel * stride_outg_c + safe_SE_Y * stride_outg_h + safe_SE_X * stride_outg_w
         outgSE = tl.load(tenOutgrad_ptr + offsetSE, mask=maskSE, other=0.0)
         fltFlowgrad += outgSE * fltIn * fltSoutheast
 
@@ -264,9 +287,6 @@ class softsplat_func(torch.autograd.Function):
     @staticmethod
     def backward(ctx, tenOutgrad):
         tenIn, tenFlow = ctx.saved_tensors
-
-        # WE REMOVED .contiguous() HERE TO AVOID OVERHEAD
-        # tenOutgrad = tenOutgrad.contiguous()
 
         N, C, H, W = tenIn.shape
 

@@ -77,8 +77,8 @@ class RAFT(nn.Module):
     def initialize_flow(self, img):
         """Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
         N, C, H, W = img.shape
-        coords0 = coords_grid(N, H // 8, W // 8, device=img.device)
-        coords1 = coords_grid(N, H // 8, W // 8, device=img.device)
+        coords0 = coords_grid(N, H // 8, W // 8, device=img.device).to(img.dtype)
+        coords1 = coords_grid(N, H // 8, W // 8, device=img.device).to(img.dtype)
 
         # optical flow computed as difference: flow = coords1 - coords0
         return coords0, coords1
@@ -118,8 +118,6 @@ class RAFT(nn.Module):
         with autocast(enabled=self.args.mixed_precision):
             fmap1, fmap2 = self.fnet([image1, image2])
 
-        fmap1 = fmap1.float()
-        fmap2 = fmap2.float()
         if self.args.alternate_corr:
             corr_fn = AlternateCorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
         else:
