@@ -9,6 +9,7 @@
 # raft: https://github.com/princeton-vl/RAFT
 # --------------------------------------------------------
 
+import math
 import torch
 import torch.nn.functional as F
 from .utils.utils import bilinear_sampler, coords_grid
@@ -76,8 +77,8 @@ class BidirCorrBlock:
         out = torch.cat(out_pyramid, dim=-1)
         out_T = torch.cat(out_pyramid_T, dim=-1)
         return (
-            out.permute(0, 3, 1, 2).float(),
-            out_T.permute(0, 3, 1, 2).float(),
+            out.permute(0, 3, 1, 2),
+            out_T.permute(0, 3, 1, 2),
         )
 
     @staticmethod
@@ -88,7 +89,7 @@ class BidirCorrBlock:
 
         corr = torch.matmul(fmap1.transpose(1, 2), fmap2)
         corr = corr.view(batch, ht, wd, 1, ht, wd)
-        return corr / torch.sqrt(torch.tensor(dim).float())
+        return corr / math.sqrt(dim)
 
 
 class AlternateCorrBlock:
@@ -122,7 +123,7 @@ class AlternateCorrBlock:
 
         corr = torch.stack(corr_list, dim=1)
         corr = corr.reshape(B, -1, H, W)
-        return corr / torch.sqrt(torch.tensor(dim).float())
+        return corr / math.sqrt(dim)
 
 
 class CorrBlock:
@@ -163,7 +164,7 @@ class CorrBlock:
             out_pyramid.append(corr)
 
         out = torch.cat(out_pyramid, dim=-1)
-        return out.permute(0, 3, 1, 2).float()
+        return out.permute(0, 3, 1, 2)
 
     @staticmethod
     def corr(fmap1, fmap2):
@@ -173,4 +174,4 @@ class CorrBlock:
 
         corr = torch.matmul(fmap1.transpose(1, 2), fmap2)
         corr = corr.view(batch, ht, wd, 1, ht, wd)
-        return corr / torch.sqrt(torch.tensor(dim).float())
+        return corr / math.sqrt(dim)
