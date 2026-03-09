@@ -410,7 +410,7 @@ class CostPerceiverEncoder(nn.Module):
         B, heads, H1, W1, H2, W2 = cost_volume.shape
         cost_maps = (
             cost_volume.permute(0, 2, 3, 1, 4, 5)
-            .contiguous()
+
             .view(B * H1 * W1, self.cfg.cost_heads_num, H2, W2)
         )
         data["cost_maps"] = cost_maps
@@ -528,8 +528,8 @@ class MemoryEncoder(nn.Module):
             for layer in self.layers:
                 feat_s, feat_t = layer(feat_s, feat_t, size)
 
-            feat_s = feat_s.reshape(B, *size, -1).permute(0, 3, 1, 2).contiguous()
-            feat_t = feat_t.reshape(B, *size, -1).permute(0, 3, 1, 2).contiguous()
+            feat_s = feat_s.reshape(B, *size, -1).permute(0, 3, 1, 2)
+            feat_t = feat_t.reshape(B, *size, -1).permute(0, 3, 1, 2)
 
         cost_volume = self.corr(feat_s, feat_t)
         x = self.cost_perceiver_encoder(cost_volume, data, context)

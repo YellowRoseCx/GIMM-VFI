@@ -8,280 +8,297 @@
 # softmax-splatting: https://github.com/sniklaus/softmax-splatting
 # --------------------------------------------------------
 
-import collections
-import cupy
-import os
-import re
 import torch
-import typing
+import triton
+import triton.language as tl
 
+@triton.jit
+def softsplat_fwd_kernel(
+    tenIn_ptr, tenFlow_ptr, tenOut_ptr,
+    N, C, H, W,
+    stride_in_n, stride_in_c, stride_in_h, stride_in_w,
+    stride_flow_n, stride_flow_c, stride_flow_h, stride_flow_w,
+    stride_out_n, stride_out_c, stride_out_h, stride_out_w,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    intIndex = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = intIndex < N * C * H * W
 
-##########################################################
+    intX = intIndex % W
+    intY = (intIndex // W) % H
+    intC = (intIndex // (W * H)) % C
+    intN = (intIndex // (W * H * C)) % N
 
+    offset_flow_x = intN * stride_flow_n + 0 * stride_flow_c + intY * stride_flow_h + intX * stride_flow_w
+    offset_flow_y = intN * stride_flow_n + 1 * stride_flow_c + intY * stride_flow_h + intX * stride_flow_w
 
-objCudacache = {}
+    flowX = tl.load(tenFlow_ptr + offset_flow_x, mask=mask, other=0.0)
+    flowY = tl.load(tenFlow_ptr + offset_flow_y, mask=mask, other=0.0)
 
+    fltX = intX + flowX
+    fltY = intY + flowY
 
-def cuda_int32(intIn: int):
-    return cupy.int32(intIn)
+    intNorthwestX = tl.math.floor(fltX)
+    intNorthwestY = tl.math.floor(fltY)
 
+    intNorthwestX_int = intNorthwestX.to(tl.int32)
+    intNorthwestY_int = intNorthwestY.to(tl.int32)
 
-# end
+    intNortheastX_int = intNorthwestX_int + 1
+    intNortheastY_int = intNorthwestY_int
 
+    intSouthwestX_int = intNorthwestX_int
+    intSouthwestY_int = intNorthwestY_int + 1
 
-def cuda_float32(fltIn: float):
-    return cupy.float32(fltIn)
+    intSoutheastX_int = intNorthwestX_int + 1
+    intSoutheastY_int = intNorthwestY_int + 1
 
+    fltNorthwest = (intSoutheastX_int - fltX) * (intSoutheastY_int - fltY)
+    fltNortheast = (fltX - intSouthwestX_int) * (intSouthwestY_int - fltY)
+    fltSouthwest = (intNortheastX_int - fltX) * (fltY - intNortheastY_int)
+    fltSoutheast = (fltX - intNorthwestX_int) * (fltY - intNorthwestY_int)
 
-# end
+    offset_in = intN * stride_in_n + intC * stride_in_c + intY * stride_in_h + intX * stride_in_w
+    fltIn = tl.load(tenIn_ptr + offset_in, mask=mask, other=0.0)
 
+    maskNW = mask & (intNorthwestX_int >= 0) & (intNorthwestX_int < W) & (intNorthwestY_int >= 0) & (intNorthwestY_int < H)
+    offsetNW = intN * stride_out_n + intC * stride_out_c + intNorthwestY_int * stride_out_h + intNorthwestX_int * stride_out_w
+    tl.atomic_add(tenOut_ptr + offsetNW, fltIn * fltNorthwest, mask=maskNW)
 
-def cuda_kernel(strFunction: str, strKernel: str, objVariables: typing.Dict):
-    if "device" not in objCudacache:
-        objCudacache["device"] = torch.cuda.get_device_name()
-    # end
+    maskNE = mask & (intNortheastX_int >= 0) & (intNortheastX_int < W) & (intNortheastY_int >= 0) & (intNortheastY_int < H)
+    offsetNE = intN * stride_out_n + intC * stride_out_c + intNortheastY_int * stride_out_h + intNortheastX_int * stride_out_w
+    tl.atomic_add(tenOut_ptr + offsetNE, fltIn * fltNortheast, mask=maskNE)
 
-    strKey = strFunction
+    maskSW = mask & (intSouthwestX_int >= 0) & (intSouthwestX_int < W) & (intSouthwestY_int >= 0) & (intSouthwestY_int < H)
+    offsetSW = intN * stride_out_n + intC * stride_out_c + intSouthwestY_int * stride_out_h + intSouthwestX_int * stride_out_w
+    tl.atomic_add(tenOut_ptr + offsetSW, fltIn * fltSouthwest, mask=maskSW)
 
-    for strVariable in objVariables:
-        objValue = objVariables[strVariable]
+    maskSE = mask & (intSoutheastX_int >= 0) & (intSoutheastX_int < W) & (intSoutheastY_int >= 0) & (intSoutheastY_int < H)
+    offsetSE = intN * stride_out_n + intC * stride_out_c + intSoutheastY_int * stride_out_h + intSoutheastX_int * stride_out_w
+    tl.atomic_add(tenOut_ptr + offsetSE, fltIn * fltSoutheast, mask=maskSE)
 
-        strKey += strVariable
+@triton.jit
+def softsplat_bwd_ingrad_kernel(
+    tenIn_ptr, tenFlow_ptr, tenOutgrad_ptr, tenIngrad_ptr,
+    N, C, H, W,
+    stride_in_n, stride_in_c, stride_in_h, stride_in_w,
+    stride_flow_n, stride_flow_c, stride_flow_h, stride_flow_w,
+    stride_outg_n, stride_outg_c, stride_outg_h, stride_outg_w,
+    stride_ing_n, stride_ing_c, stride_ing_h, stride_ing_w,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    intIndex = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = intIndex < N * C * H * W
 
-        if objValue is None:
-            continue
+    intX = intIndex % W
+    intY = (intIndex // W) % H
+    intC = (intIndex // (W * H)) % C
+    intN = (intIndex // (W * H * C)) % N
 
-        elif type(objValue) == int:
-            strKey += str(objValue)
+    offset_flow_x = intN * stride_flow_n + 0 * stride_flow_c + intY * stride_flow_h + intX * stride_flow_w
+    offset_flow_y = intN * stride_flow_n + 1 * stride_flow_c + intY * stride_flow_h + intX * stride_flow_w
 
-        elif type(objValue) == float:
-            strKey += str(objValue)
+    flowX = tl.load(tenFlow_ptr + offset_flow_x, mask=mask, other=0.0)
+    flowY = tl.load(tenFlow_ptr + offset_flow_y, mask=mask, other=0.0)
 
-        elif type(objValue) == bool:
-            strKey += str(objValue)
+    fltX = intX + flowX
+    fltY = intY + flowY
 
-        elif type(objValue) == str:
-            strKey += objValue
+    intNorthwestX = tl.math.floor(fltX)
+    intNorthwestY = tl.math.floor(fltY)
 
-        elif type(objValue) == torch.Tensor:
-            strKey += str(objValue.dtype)
-            strKey += str(objValue.shape)
-            strKey += str(objValue.stride())
+    intNorthwestX_int = intNorthwestX.to(tl.int32)
+    intNorthwestY_int = intNorthwestY.to(tl.int32)
 
-        elif True:
-            print(strVariable, type(objValue))
-            assert False
+    intNortheastX_int = intNorthwestX_int + 1
+    intNortheastY_int = intNorthwestY_int
 
-        # end
-    # end
+    intSouthwestX_int = intNorthwestX_int
+    intSouthwestY_int = intNorthwestY_int + 1
 
-    strKey += objCudacache["device"]
+    intSoutheastX_int = intNorthwestX_int + 1
+    intSoutheastY_int = intNorthwestY_int + 1
 
-    if strKey not in objCudacache:
-        for strVariable in objVariables:
-            objValue = objVariables[strVariable]
+    fltNorthwest = (intSoutheastX_int - fltX) * (intSoutheastY_int - fltY)
+    fltNortheast = (fltX - intSouthwestX_int) * (intSouthwestY_int - fltY)
+    fltSouthwest = (intNortheastX_int - fltX) * (fltY - intNortheastY_int)
+    fltSoutheast = (fltX - intNorthwestX_int) * (fltY - intNorthwestY_int)
 
-            if objValue is None:
-                continue
+    fltIngrad = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
 
-            elif type(objValue) == int:
-                strKernel = strKernel.replace("{{" + strVariable + "}}", str(objValue))
+    maskNW = mask & (intNorthwestX_int >= 0) & (intNorthwestX_int < W) & (intNorthwestY_int >= 0) & (intNorthwestY_int < H)
+    offsetNW = intN * stride_outg_n + intC * stride_outg_c + intNorthwestY_int * stride_outg_h + intNorthwestX_int * stride_outg_w
+    outgNW = tl.load(tenOutgrad_ptr + offsetNW, mask=maskNW, other=0.0)
+    fltIngrad += outgNW * fltNorthwest
 
-            elif type(objValue) == float:
-                strKernel = strKernel.replace("{{" + strVariable + "}}", str(objValue))
+    maskNE = mask & (intNortheastX_int >= 0) & (intNortheastX_int < W) & (intNortheastY_int >= 0) & (intNortheastY_int < H)
+    offsetNE = intN * stride_outg_n + intC * stride_outg_c + intNortheastY_int * stride_outg_h + intNortheastX_int * stride_outg_w
+    outgNE = tl.load(tenOutgrad_ptr + offsetNE, mask=maskNE, other=0.0)
+    fltIngrad += outgNE * fltNortheast
 
-            elif type(objValue) == bool:
-                strKernel = strKernel.replace("{{" + strVariable + "}}", str(objValue))
+    maskSW = mask & (intSouthwestX_int >= 0) & (intSouthwestX_int < W) & (intSouthwestY_int >= 0) & (intSouthwestY_int < H)
+    offsetSW = intN * stride_outg_n + intC * stride_outg_c + intSouthwestY_int * stride_outg_h + intSouthwestX_int * stride_outg_w
+    outgSW = tl.load(tenOutgrad_ptr + offsetSW, mask=maskSW, other=0.0)
+    fltIngrad += outgSW * fltSouthwest
 
-            elif type(objValue) == str:
-                strKernel = strKernel.replace("{{" + strVariable + "}}", objValue)
+    maskSE = mask & (intSoutheastX_int >= 0) & (intSoutheastX_int < W) & (intSoutheastY_int >= 0) & (intSoutheastY_int < H)
+    offsetSE = intN * stride_outg_n + intC * stride_outg_c + intSoutheastY_int * stride_outg_h + intSoutheastX_int * stride_outg_w
+    outgSE = tl.load(tenOutgrad_ptr + offsetSE, mask=maskSE, other=0.0)
+    fltIngrad += outgSE * fltSoutheast
 
-            elif type(objValue) == torch.Tensor and objValue.dtype == torch.uint8:
-                strKernel = strKernel.replace("{{type}}", "unsigned char")
+    offset_ing = intN * stride_ing_n + intC * stride_ing_c + intY * stride_ing_h + intX * stride_ing_w
+    tl.store(tenIngrad_ptr + offset_ing, fltIngrad, mask=mask)
 
-            elif type(objValue) == torch.Tensor and objValue.dtype == torch.float16:
-                strKernel = strKernel.replace("{{type}}", "half")
+@triton.jit
+def softsplat_bwd_flowgrad_kernel(
+    tenIn_ptr, tenFlow_ptr, tenOutgrad_ptr, tenFlowgrad_ptr,
+    N, C_in, H, W,
+    stride_in_n, stride_in_c, stride_in_h, stride_in_w,
+    stride_flow_n, stride_flow_c, stride_flow_h, stride_flow_w,
+    stride_outg_n, stride_outg_c, stride_outg_h, stride_outg_w,
+    stride_flowg_n, stride_flowg_c, stride_flowg_h, stride_flowg_w,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    intIndex = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = intIndex < N * 2 * H * W
 
-            elif type(objValue) == torch.Tensor and objValue.dtype == torch.float32:
-                strKernel = strKernel.replace("{{type}}", "float")
+    intX = intIndex % W
+    intY = (intIndex // W) % H
+    intC_flow = (intIndex // (W * H)) % 2
+    intN = (intIndex // (W * H * 2)) % N
 
-            elif type(objValue) == torch.Tensor and objValue.dtype == torch.float64:
-                strKernel = strKernel.replace("{{type}}", "double")
+    offset_flow_x = intN * stride_flow_n + 0 * stride_flow_c + intY * stride_flow_h + intX * stride_flow_w
+    offset_flow_y = intN * stride_flow_n + 1 * stride_flow_c + intY * stride_flow_h + intX * stride_flow_w
 
-            elif type(objValue) == torch.Tensor and objValue.dtype == torch.int32:
-                strKernel = strKernel.replace("{{type}}", "int")
+    flowX = tl.load(tenFlow_ptr + offset_flow_x, mask=mask, other=0.0)
+    flowY = tl.load(tenFlow_ptr + offset_flow_y, mask=mask, other=0.0)
 
-            elif type(objValue) == torch.Tensor and objValue.dtype == torch.int64:
-                strKernel = strKernel.replace("{{type}}", "long")
+    fltX = intX + flowX
+    fltY = intY + flowY
 
-            elif type(objValue) == torch.Tensor:
-                print(strVariable, objValue.dtype)
-                assert False
+    intNorthwestX = tl.math.floor(fltX)
+    intNorthwestY = tl.math.floor(fltY)
 
-            elif True:
-                print(strVariable, type(objValue))
-                assert False
+    intNorthwestX_int = intNorthwestX.to(tl.int32)
+    intNorthwestY_int = intNorthwestY.to(tl.int32)
 
-            # end
-        # end
+    intNortheastX_int = intNorthwestX_int + 1
+    intNortheastY_int = intNorthwestY_int
 
-        while True:
-            objMatch = re.search("(SIZE_)([0-4])(\()([^\)]*)(\))", strKernel)
+    intSouthwestX_int = intNorthwestX_int
+    intSouthwestY_int = intNorthwestY_int + 1
 
-            if objMatch is None:
-                break
-            # end
+    intSoutheastX_int = intNorthwestX_int + 1
+    intSoutheastY_int = intNorthwestY_int + 1
 
-            intArg = int(objMatch.group(2))
+    fltNorthwest = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    fltNortheast = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    fltSouthwest = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    fltSoutheast = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
 
-            strTensor = objMatch.group(4)
-            intSizes = objVariables[strTensor].size()
+    mask_c0 = mask & (intC_flow == 0)
+    mask_c1 = mask & (intC_flow == 1)
 
-            strKernel = strKernel.replace(
-                objMatch.group(),
-                str(
-                    intSizes[intArg]
-                    if torch.is_tensor(intSizes[intArg]) == False
-                    else intSizes[intArg].item()
-                ),
+    fltNorthwest = tl.where(mask_c0, -1.0 * (intSoutheastY_int - fltY), fltNorthwest)
+    fltNortheast = tl.where(mask_c0,  1.0 * (intSouthwestY_int - fltY), fltNortheast)
+    fltSouthwest = tl.where(mask_c0, -1.0 * (fltY - intNortheastY_int), fltSouthwest)
+    fltSoutheast = tl.where(mask_c0,  1.0 * (fltY - intNorthwestY_int), fltSoutheast)
+
+    fltNorthwest = tl.where(mask_c1, (intSoutheastX_int - fltX) * -1.0, fltNorthwest)
+    fltNortheast = tl.where(mask_c1, (fltX - intSouthwestX_int) * -1.0, fltNortheast)
+    fltSouthwest = tl.where(mask_c1, (intNortheastX_int - fltX) *  1.0, fltSouthwest)
+    fltSoutheast = tl.where(mask_c1, (fltX - intNorthwestX_int) *  1.0, fltSoutheast)
+
+    fltFlowgrad = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+    for intChannel in range(C_in):
+        offset_in = intN * stride_in_n + intChannel * stride_in_c + intY * stride_in_h + intX * stride_in_w
+        fltIn = tl.load(tenIn_ptr + offset_in, mask=mask, other=0.0)
+
+        maskNW = mask & (intNorthwestX_int >= 0) & (intNorthwestX_int < W) & (intNorthwestY_int >= 0) & (intNorthwestY_int < H)
+        offsetNW = intN * stride_outg_n + intChannel * stride_outg_c + intNorthwestY_int * stride_outg_h + intNorthwestX_int * stride_outg_w
+        outgNW = tl.load(tenOutgrad_ptr + offsetNW, mask=maskNW, other=0.0)
+        fltFlowgrad += outgNW * fltIn * fltNorthwest
+
+        maskNE = mask & (intNortheastX_int >= 0) & (intNortheastX_int < W) & (intNortheastY_int >= 0) & (intNortheastY_int < H)
+        offsetNE = intN * stride_outg_n + intChannel * stride_outg_c + intNortheastY_int * stride_outg_h + intNortheastX_int * stride_outg_w
+        outgNE = tl.load(tenOutgrad_ptr + offsetNE, mask=maskNE, other=0.0)
+        fltFlowgrad += outgNE * fltIn * fltNortheast
+
+        maskSW = mask & (intSouthwestX_int >= 0) & (intSouthwestX_int < W) & (intSouthwestY_int >= 0) & (intSouthwestY_int < H)
+        offsetSW = intN * stride_outg_n + intChannel * stride_outg_c + intSouthwestY_int * stride_outg_h + intSouthwestX_int * stride_outg_w
+        outgSW = tl.load(tenOutgrad_ptr + offsetSW, mask=maskSW, other=0.0)
+        fltFlowgrad += outgSW * fltIn * fltSouthwest
+
+        maskSE = mask & (intSoutheastX_int >= 0) & (intSoutheastX_int < W) & (intSoutheastY_int >= 0) & (intSoutheastY_int < H)
+        offsetSE = intN * stride_outg_n + intChannel * stride_outg_c + intSoutheastY_int * stride_outg_h + intSoutheastX_int * stride_outg_w
+        outgSE = tl.load(tenOutgrad_ptr + offsetSE, mask=maskSE, other=0.0)
+        fltFlowgrad += outgSE * fltIn * fltSoutheast
+
+    offset_flowg = intN * stride_flowg_n + intC_flow * stride_flowg_c + intY * stride_flowg_h + intX * stride_flowg_w
+    tl.store(tenFlowgrad_ptr + offset_flowg, fltFlowgrad, mask=mask)
+
+class softsplat_func(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tenIn, tenFlow):
+        tenOut = tenIn.new_zeros([tenIn.shape[0], tenIn.shape[1], tenIn.shape[2], tenIn.shape[3]])
+
+        N, C, H, W = tenIn.shape
+        grid = lambda meta: (triton.cdiv(N * C * H * W, meta['BLOCK_SIZE']),)
+
+        softsplat_fwd_kernel[grid](
+            tenIn, tenFlow, tenOut,
+            N, C, H, W,
+            tenIn.stride(0), tenIn.stride(1), tenIn.stride(2), tenIn.stride(3),
+            tenFlow.stride(0), tenFlow.stride(1), tenFlow.stride(2), tenFlow.stride(3),
+            tenOut.stride(0), tenOut.stride(1), tenOut.stride(2), tenOut.stride(3),
+            BLOCK_SIZE=512
+        )
+
+        ctx.save_for_backward(tenIn, tenFlow)
+        return tenOut
+
+    @staticmethod
+    def backward(ctx, tenOutgrad):
+        tenIn, tenFlow = ctx.saved_tensors
+
+        # WE REMOVED .contiguous() HERE TO AVOID OVERHEAD
+        # tenOutgrad = tenOutgrad.contiguous()
+
+        N, C, H, W = tenIn.shape
+
+        tenIngrad = None
+        if ctx.needs_input_grad[0]:
+            tenIngrad = tenIn.new_zeros([N, C, H, W])
+            grid_in = lambda meta: (triton.cdiv(N * C * H * W, meta['BLOCK_SIZE']),)
+            softsplat_bwd_ingrad_kernel[grid_in](
+                tenIn, tenFlow, tenOutgrad, tenIngrad,
+                N, C, H, W,
+                tenIn.stride(0), tenIn.stride(1), tenIn.stride(2), tenIn.stride(3),
+                tenFlow.stride(0), tenFlow.stride(1), tenFlow.stride(2), tenFlow.stride(3),
+                tenOutgrad.stride(0), tenOutgrad.stride(1), tenOutgrad.stride(2), tenOutgrad.stride(3),
+                tenIngrad.stride(0), tenIngrad.stride(1), tenIngrad.stride(2), tenIngrad.stride(3),
+                BLOCK_SIZE=512
             )
-        # end
 
-        while True:
-            objMatch = re.search("(OFFSET_)([0-4])(\()", strKernel)
-
-            if objMatch is None:
-                break
-            # end
-
-            intStart = objMatch.span()[1]
-            intStop = objMatch.span()[1]
-            intParentheses = 1
-
-            while True:
-                intParentheses += 1 if strKernel[intStop] == "(" else 0
-                intParentheses -= 1 if strKernel[intStop] == ")" else 0
-
-                if intParentheses == 0:
-                    break
-                # end
-
-                intStop += 1
-            # end
-
-            intArgs = int(objMatch.group(2))
-            strArgs = strKernel[intStart:intStop].split(",")
-
-            assert intArgs == len(strArgs) - 1
-
-            strTensor = strArgs[0]
-            intStrides = objVariables[strTensor].stride()
-
-            strIndex = []
-
-            for intArg in range(intArgs):
-                strIndex.append(
-                    "(("
-                    + strArgs[intArg + 1].replace("{", "(").replace("}", ")").strip()
-                    + ")*"
-                    + str(
-                        intStrides[intArg]
-                        if torch.is_tensor(intStrides[intArg]) == False
-                        else intStrides[intArg].item()
-                    )
-                    + ")"
-                )
-            # end
-
-            strKernel = strKernel.replace(
-                "OFFSET_" + str(intArgs) + "(" + strKernel[intStart:intStop] + ")",
-                "(" + str.join("+", strIndex) + ")",
+        tenFlowgrad = None
+        if ctx.needs_input_grad[1]:
+            tenFlowgrad = tenFlow.new_zeros([N, 2, H, W])
+            grid_flow = lambda meta: (triton.cdiv(N * 2 * H * W, meta['BLOCK_SIZE']),)
+            softsplat_bwd_flowgrad_kernel[grid_flow](
+                tenIn, tenFlow, tenOutgrad, tenFlowgrad,
+                N, C, H, W,
+                tenIn.stride(0), tenIn.stride(1), tenIn.stride(2), tenIn.stride(3),
+                tenFlow.stride(0), tenFlow.stride(1), tenFlow.stride(2), tenFlow.stride(3),
+                tenOutgrad.stride(0), tenOutgrad.stride(1), tenOutgrad.stride(2), tenOutgrad.stride(3),
+                tenFlowgrad.stride(0), tenFlowgrad.stride(1), tenFlowgrad.stride(2), tenFlowgrad.stride(3),
+                BLOCK_SIZE=512
             )
-        # end
 
-        while True:
-            objMatch = re.search("(VALUE_)([0-4])(\()", strKernel)
-
-            if objMatch is None:
-                break
-            # end
-
-            intStart = objMatch.span()[1]
-            intStop = objMatch.span()[1]
-            intParentheses = 1
-
-            while True:
-                intParentheses += 1 if strKernel[intStop] == "(" else 0
-                intParentheses -= 1 if strKernel[intStop] == ")" else 0
-
-                if intParentheses == 0:
-                    break
-                # end
-
-                intStop += 1
-            # end
-
-            intArgs = int(objMatch.group(2))
-            strArgs = strKernel[intStart:intStop].split(",")
-
-            assert intArgs == len(strArgs) - 1
-
-            strTensor = strArgs[0]
-            intStrides = objVariables[strTensor].stride()
-
-            strIndex = []
-
-            for intArg in range(intArgs):
-                strIndex.append(
-                    "(("
-                    + strArgs[intArg + 1].replace("{", "(").replace("}", ")").strip()
-                    + ")*"
-                    + str(
-                        intStrides[intArg]
-                        if torch.is_tensor(intStrides[intArg]) == False
-                        else intStrides[intArg].item()
-                    )
-                    + ")"
-                )
-            # end
-
-            strKernel = strKernel.replace(
-                "VALUE_" + str(intArgs) + "(" + strKernel[intStart:intStop] + ")",
-                strTensor + "[" + str.join("+", strIndex) + "]",
-            )
-        # end
-
-        objCudacache[strKey] = {"strFunction": strFunction, "strKernel": strKernel}
-    # end
-
-    return strKey
-
-
-# end
-
-
-@cupy.memoize(for_each_device=True)
-def cuda_launch(strKey: str):
-    if "CUDA_HOME" not in os.environ:
-        os.environ["CUDA_HOME"] = cupy.cuda.get_cuda_path()
-    # end
-
-    return cupy.cuda.compile_with_cache(
-        objCudacache[strKey]["strKernel"],
-        tuple(
-            [
-                "-I " + os.environ["CUDA_HOME"],
-                "-I " + os.environ["CUDA_HOME"] + "/include",
-            ]
-        ),
-    ).get_function(objCudacache[strKey]["strFunction"])
-
-
-# end
-
-
-##########################################################
-
+        return tenIngrad, tenFlowgrad
 
 def softsplat(tenIn, tenFlow, tenMetric, strMode, return_norm=False):
     assert strMode.split("-")[0] in ["sum", "avg", "linear", "softmax"]
@@ -310,7 +327,6 @@ def softsplat(tenIn, tenFlow, tenMetric, strMode, return_norm=False):
     elif strMode.split("-")[0] == "softmax":
         tenIn = torch.cat([tenIn * tenMetric.exp(), tenMetric.exp()], 1)
 
-    # end
     if torch.isnan(tenIn).any():
         print("NaN values detected during training in tenIn. Exiting.")
         assert False
@@ -336,8 +352,6 @@ def softsplat(tenIn, tenFlow, tenMetric, strMode, return_norm=False):
         elif strMode.split("-")[1] == "clipeps":
             tenNormalize = tenNormalize.clip(0.0000001, None)
 
-        # end
-
         if return_norm:
             return tenOut[:, :-1, :, :], tenNormalize
 
@@ -347,322 +361,4 @@ def softsplat(tenIn, tenFlow, tenMetric, strMode, return_norm=False):
         print("NaN values detected during training in tenOut_2. Exiting.")
         assert False
 
-    # end
-
     return tenOut
-
-
-# end
-
-
-class softsplat_func(torch.autograd.Function):
-    @staticmethod
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
-    def forward(self, tenIn, tenFlow):
-        tenOut = tenIn.new_zeros(
-            [tenIn.shape[0], tenIn.shape[1], tenIn.shape[2], tenIn.shape[3]]
-        )
-
-        if tenIn.is_cuda == True:
-            cuda_launch(
-                cuda_kernel(
-                    "softsplat_out",
-                    """
-                extern "C" __global__ void __launch_bounds__(512) softsplat_out(
-                    const int n,
-                    const {{type}}* __restrict__ tenIn,
-                    const {{type}}* __restrict__ tenFlow,
-                    {{type}}* __restrict__ tenOut
-                ) { for (int intIndex = (blockIdx.x * blockDim.x) + threadIdx.x; intIndex < n; intIndex += blockDim.x * gridDim.x) {
-                    const int intN = ( intIndex / SIZE_3(tenOut) / SIZE_2(tenOut) / SIZE_1(tenOut) ) % SIZE_0(tenOut);
-                    const int intC = ( intIndex / SIZE_3(tenOut) / SIZE_2(tenOut)                  ) % SIZE_1(tenOut);
-                    const int intY = ( intIndex / SIZE_3(tenOut)                                   ) % SIZE_2(tenOut);
-                    const int intX = ( intIndex                                                    ) % SIZE_3(tenOut);
-
-                    assert(SIZE_1(tenFlow) == 2);
-
-                    {{type}} fltX = ({{type}}) (intX) + VALUE_4(tenFlow, intN, 0, intY, intX);
-                    {{type}} fltY = ({{type}}) (intY) + VALUE_4(tenFlow, intN, 1, intY, intX);
-
-                    if (isfinite(fltX) == false) { return; }
-                    if (isfinite(fltY) == false) { return; }
-
-                    {{type}} fltIn = VALUE_4(tenIn, intN, intC, intY, intX);
-
-                    int intNorthwestX = (int) (floor(fltX));
-                    int intNorthwestY = (int) (floor(fltY));
-                    int intNortheastX = intNorthwestX + 1;
-                    int intNortheastY = intNorthwestY;
-                    int intSouthwestX = intNorthwestX;
-                    int intSouthwestY = intNorthwestY + 1;
-                    int intSoutheastX = intNorthwestX + 1;
-                    int intSoutheastY = intNorthwestY + 1;
-
-                    {{type}} fltNorthwest = (({{type}}) (intSoutheastX) - fltX) * (({{type}}) (intSoutheastY) - fltY);
-                    {{type}} fltNortheast = (fltX - ({{type}}) (intSouthwestX)) * (({{type}}) (intSouthwestY) - fltY);
-                    {{type}} fltSouthwest = (({{type}}) (intNortheastX) - fltX) * (fltY - ({{type}}) (intNortheastY));
-                    {{type}} fltSoutheast = (fltX - ({{type}}) (intNorthwestX)) * (fltY - ({{type}}) (intNorthwestY));
-
-                    if ((intNorthwestX >= 0) && (intNorthwestX < SIZE_3(tenOut)) && (intNorthwestY >= 0) && (intNorthwestY < SIZE_2(tenOut))) {
-                        atomicAdd(&tenOut[OFFSET_4(tenOut, intN, intC, intNorthwestY, intNorthwestX)], fltIn * fltNorthwest);
-                    }
-
-                    if ((intNortheastX >= 0) && (intNortheastX < SIZE_3(tenOut)) && (intNortheastY >= 0) && (intNortheastY < SIZE_2(tenOut))) {
-                        atomicAdd(&tenOut[OFFSET_4(tenOut, intN, intC, intNortheastY, intNortheastX)], fltIn * fltNortheast);
-                    }
-
-                    if ((intSouthwestX >= 0) && (intSouthwestX < SIZE_3(tenOut)) && (intSouthwestY >= 0) && (intSouthwestY < SIZE_2(tenOut))) {
-                        atomicAdd(&tenOut[OFFSET_4(tenOut, intN, intC, intSouthwestY, intSouthwestX)], fltIn * fltSouthwest);
-                    }
-
-                    if ((intSoutheastX >= 0) && (intSoutheastX < SIZE_3(tenOut)) && (intSoutheastY >= 0) && (intSoutheastY < SIZE_2(tenOut))) {
-                        atomicAdd(&tenOut[OFFSET_4(tenOut, intN, intC, intSoutheastY, intSoutheastX)], fltIn * fltSoutheast);
-                    }
-                } }
-            """,
-                    {"tenIn": tenIn, "tenFlow": tenFlow, "tenOut": tenOut},
-                )
-            )(
-                grid=tuple([int((tenOut.nelement() + 512 - 1) / 512), 1, 1]),
-                block=tuple([512, 1, 1]),
-                args=[
-                    cuda_int32(tenOut.nelement()),
-                    tenIn.data_ptr(),
-                    tenFlow.data_ptr(),
-                    tenOut.data_ptr(),
-                ],
-                stream=collections.namedtuple("Stream", "ptr")(
-                    torch.cuda.current_stream().cuda_stream
-                ),
-            )
-
-        elif tenIn.is_cuda != True:
-            assert False
-
-        # end
-
-        self.save_for_backward(tenIn, tenFlow)
-
-        return tenOut
-
-    # end
-
-    @staticmethod
-    @torch.cuda.amp.custom_bwd
-    def backward(self, tenOutgrad):
-        tenIn, tenFlow = self.saved_tensors
-
-        tenOutgrad = tenOutgrad.contiguous()
-        assert tenOutgrad.is_cuda == True
-
-        tenIngrad = (
-            tenIn.new_zeros(
-                [tenIn.shape[0], tenIn.shape[1], tenIn.shape[2], tenIn.shape[3]]
-            )
-            if self.needs_input_grad[0] == True
-            else None
-        )
-        tenFlowgrad = (
-            tenFlow.new_zeros(
-                [tenFlow.shape[0], tenFlow.shape[1], tenFlow.shape[2], tenFlow.shape[3]]
-            )
-            if self.needs_input_grad[1] == True
-            else None
-        )
-
-        if tenIngrad is not None:
-            cuda_launch(
-                cuda_kernel(
-                    "softsplat_ingrad",
-                    """
-                extern "C" __global__ void __launch_bounds__(512) softsplat_ingrad(
-                    const int n,
-                    const {{type}}* __restrict__ tenIn,
-                    const {{type}}* __restrict__ tenFlow,
-                    const {{type}}* __restrict__ tenOutgrad,
-                    {{type}}* __restrict__ tenIngrad,
-                    {{type}}* __restrict__ tenFlowgrad
-                ) { for (int intIndex = (blockIdx.x * blockDim.x) + threadIdx.x; intIndex < n; intIndex += blockDim.x * gridDim.x) {
-                    const int intN = ( intIndex / SIZE_3(tenIngrad) / SIZE_2(tenIngrad) / SIZE_1(tenIngrad) ) % SIZE_0(tenIngrad);
-                    const int intC = ( intIndex / SIZE_3(tenIngrad) / SIZE_2(tenIngrad)                     ) % SIZE_1(tenIngrad);
-                    const int intY = ( intIndex / SIZE_3(tenIngrad)                                         ) % SIZE_2(tenIngrad);
-                    const int intX = ( intIndex                                                             ) % SIZE_3(tenIngrad);
-
-                    assert(SIZE_1(tenFlow) == 2);
-
-                    {{type}} fltIngrad = 0.0f;
-
-                    {{type}} fltX = ({{type}}) (intX) + VALUE_4(tenFlow, intN, 0, intY, intX);
-                    {{type}} fltY = ({{type}}) (intY) + VALUE_4(tenFlow, intN, 1, intY, intX);
-
-                    if (isfinite(fltX) == false) { return; }
-                    if (isfinite(fltY) == false) { return; }
-
-                    int intNorthwestX = (int) (floor(fltX));
-                    int intNorthwestY = (int) (floor(fltY));
-                    int intNortheastX = intNorthwestX + 1;
-                    int intNortheastY = intNorthwestY;
-                    int intSouthwestX = intNorthwestX;
-                    int intSouthwestY = intNorthwestY + 1;
-                    int intSoutheastX = intNorthwestX + 1;
-                    int intSoutheastY = intNorthwestY + 1;
-
-                    {{type}} fltNorthwest = (({{type}}) (intSoutheastX) - fltX) * (({{type}}) (intSoutheastY) - fltY);
-                    {{type}} fltNortheast = (fltX - ({{type}}) (intSouthwestX)) * (({{type}}) (intSouthwestY) - fltY);
-                    {{type}} fltSouthwest = (({{type}}) (intNortheastX) - fltX) * (fltY - ({{type}}) (intNortheastY));
-                    {{type}} fltSoutheast = (fltX - ({{type}}) (intNorthwestX)) * (fltY - ({{type}}) (intNorthwestY));
-
-                    if ((intNorthwestX >= 0) && (intNorthwestX < SIZE_3(tenOutgrad)) && (intNorthwestY >= 0) && (intNorthwestY < SIZE_2(tenOutgrad))) {
-                        fltIngrad += VALUE_4(tenOutgrad, intN, intC, intNorthwestY, intNorthwestX) * fltNorthwest;
-                    }
-
-                    if ((intNortheastX >= 0) && (intNortheastX < SIZE_3(tenOutgrad)) && (intNortheastY >= 0) && (intNortheastY < SIZE_2(tenOutgrad))) {
-                        fltIngrad += VALUE_4(tenOutgrad, intN, intC, intNortheastY, intNortheastX) * fltNortheast;
-                    }
-
-                    if ((intSouthwestX >= 0) && (intSouthwestX < SIZE_3(tenOutgrad)) && (intSouthwestY >= 0) && (intSouthwestY < SIZE_2(tenOutgrad))) {
-                        fltIngrad += VALUE_4(tenOutgrad, intN, intC, intSouthwestY, intSouthwestX) * fltSouthwest;
-                    }
-
-                    if ((intSoutheastX >= 0) && (intSoutheastX < SIZE_3(tenOutgrad)) && (intSoutheastY >= 0) && (intSoutheastY < SIZE_2(tenOutgrad))) {
-                        fltIngrad += VALUE_4(tenOutgrad, intN, intC, intSoutheastY, intSoutheastX) * fltSoutheast;
-                    }
-
-                    tenIngrad[intIndex] = fltIngrad;
-                } }
-            """,
-                    {
-                        "tenIn": tenIn,
-                        "tenFlow": tenFlow,
-                        "tenOutgrad": tenOutgrad,
-                        "tenIngrad": tenIngrad,
-                        "tenFlowgrad": tenFlowgrad,
-                    },
-                )
-            )(
-                grid=tuple([int((tenIngrad.nelement() + 512 - 1) / 512), 1, 1]),
-                block=tuple([512, 1, 1]),
-                args=[
-                    cuda_int32(tenIngrad.nelement()),
-                    tenIn.data_ptr(),
-                    tenFlow.data_ptr(),
-                    tenOutgrad.data_ptr(),
-                    tenIngrad.data_ptr(),
-                    None,
-                ],
-                stream=collections.namedtuple("Stream", "ptr")(
-                    torch.cuda.current_stream().cuda_stream
-                ),
-            )
-        # end
-
-        if tenFlowgrad is not None:
-            cuda_launch(
-                cuda_kernel(
-                    "softsplat_flowgrad",
-                    """
-                extern "C" __global__ void __launch_bounds__(512) softsplat_flowgrad(
-                    const int n,
-                    const {{type}}* __restrict__ tenIn,
-                    const {{type}}* __restrict__ tenFlow,
-                    const {{type}}* __restrict__ tenOutgrad,
-                    {{type}}* __restrict__ tenIngrad,
-                    {{type}}* __restrict__ tenFlowgrad
-                ) { for (int intIndex = (blockIdx.x * blockDim.x) + threadIdx.x; intIndex < n; intIndex += blockDim.x * gridDim.x) {
-                    const int intN = ( intIndex / SIZE_3(tenFlowgrad) / SIZE_2(tenFlowgrad) / SIZE_1(tenFlowgrad) ) % SIZE_0(tenFlowgrad);
-                    const int intC = ( intIndex / SIZE_3(tenFlowgrad) / SIZE_2(tenFlowgrad)                       ) % SIZE_1(tenFlowgrad);
-                    const int intY = ( intIndex / SIZE_3(tenFlowgrad)                                             ) % SIZE_2(tenFlowgrad);
-                    const int intX = ( intIndex                                                                   ) % SIZE_3(tenFlowgrad);
-
-                    assert(SIZE_1(tenFlow) == 2);
-
-                    {{type}} fltFlowgrad = 0.0f;
-
-                    {{type}} fltX = ({{type}}) (intX) + VALUE_4(tenFlow, intN, 0, intY, intX);
-                    {{type}} fltY = ({{type}}) (intY) + VALUE_4(tenFlow, intN, 1, intY, intX);
-
-                    if (isfinite(fltX) == false) { return; }
-                    if (isfinite(fltY) == false) { return; }
-
-                    int intNorthwestX = (int) (floor(fltX));
-                    int intNorthwestY = (int) (floor(fltY));
-                    int intNortheastX = intNorthwestX + 1;
-                    int intNortheastY = intNorthwestY;
-                    int intSouthwestX = intNorthwestX;
-                    int intSouthwestY = intNorthwestY + 1;
-                    int intSoutheastX = intNorthwestX + 1;
-                    int intSoutheastY = intNorthwestY + 1;
-
-                    {{type}} fltNorthwest = 0.0f;
-                    {{type}} fltNortheast = 0.0f;
-                    {{type}} fltSouthwest = 0.0f;
-                    {{type}} fltSoutheast = 0.0f;
-
-                    if (intC == 0) {
-                        fltNorthwest = (({{type}}) (-1.0f)) * (({{type}}) (intSoutheastY) - fltY);
-                        fltNortheast = (({{type}}) (+1.0f)) * (({{type}}) (intSouthwestY) - fltY);
-                        fltSouthwest = (({{type}}) (-1.0f)) * (fltY - ({{type}}) (intNortheastY));
-                        fltSoutheast = (({{type}}) (+1.0f)) * (fltY - ({{type}}) (intNorthwestY));
-
-                    } else if (intC == 1) {
-                        fltNorthwest = (({{type}}) (intSoutheastX) - fltX) * (({{type}}) (-1.0f));
-                        fltNortheast = (fltX - ({{type}}) (intSouthwestX)) * (({{type}}) (-1.0f));
-                        fltSouthwest = (({{type}}) (intNortheastX) - fltX) * (({{type}}) (+1.0f));
-                        fltSoutheast = (fltX - ({{type}}) (intNorthwestX)) * (({{type}}) (+1.0f));
-
-                    }
-
-                    for (int intChannel = 0; intChannel < SIZE_1(tenOutgrad); intChannel += 1) {
-                        {{type}} fltIn = VALUE_4(tenIn, intN, intChannel, intY, intX);
-
-                        if ((intNorthwestX >= 0) && (intNorthwestX < SIZE_3(tenOutgrad)) && (intNorthwestY >= 0) && (intNorthwestY < SIZE_2(tenOutgrad))) {
-                            fltFlowgrad += VALUE_4(tenOutgrad, intN, intChannel, intNorthwestY, intNorthwestX) * fltIn * fltNorthwest;
-                        }
-
-                        if ((intNortheastX >= 0) && (intNortheastX < SIZE_3(tenOutgrad)) && (intNortheastY >= 0) && (intNortheastY < SIZE_2(tenOutgrad))) {
-                            fltFlowgrad += VALUE_4(tenOutgrad, intN, intChannel, intNortheastY, intNortheastX) * fltIn * fltNortheast;
-                        }
-
-                        if ((intSouthwestX >= 0) && (intSouthwestX < SIZE_3(tenOutgrad)) && (intSouthwestY >= 0) && (intSouthwestY < SIZE_2(tenOutgrad))) {
-                            fltFlowgrad += VALUE_4(tenOutgrad, intN, intChannel, intSouthwestY, intSouthwestX) * fltIn * fltSouthwest;
-                        }
-
-                        if ((intSoutheastX >= 0) && (intSoutheastX < SIZE_3(tenOutgrad)) && (intSoutheastY >= 0) && (intSoutheastY < SIZE_2(tenOutgrad))) {
-                            fltFlowgrad += VALUE_4(tenOutgrad, intN, intChannel, intSoutheastY, intSoutheastX) * fltIn * fltSoutheast;
-                        }
-                    }
-
-                    tenFlowgrad[intIndex] = fltFlowgrad;
-                } }
-            """,
-                    {
-                        "tenIn": tenIn,
-                        "tenFlow": tenFlow,
-                        "tenOutgrad": tenOutgrad,
-                        "tenIngrad": tenIngrad,
-                        "tenFlowgrad": tenFlowgrad,
-                    },
-                )
-            )(
-                grid=tuple([int((tenFlowgrad.nelement() + 512 - 1) / 512), 1, 1]),
-                block=tuple([512, 1, 1]),
-                args=[
-                    cuda_int32(tenFlowgrad.nelement()),
-                    tenIn.data_ptr(),
-                    tenFlow.data_ptr(),
-                    tenOutgrad.data_ptr(),
-                    None,
-                    tenFlowgrad.data_ptr(),
-                ],
-                stream=collections.namedtuple("Stream", "ptr")(
-                    torch.cuda.current_stream().cuda_stream
-                ),
-            )
-        # end
-
-        return tenIngrad, tenFlowgrad
-
-    # end
-
-
-# end

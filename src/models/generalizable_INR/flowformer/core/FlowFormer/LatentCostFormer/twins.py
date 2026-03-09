@@ -198,7 +198,7 @@ class GroupAttnRPEContext(nn.Module):
         attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+            x = x[:, :H, :W, :]
         x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -315,7 +315,7 @@ class GroupAttnRPE(nn.Module):
         attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+            x = x[:, :H, :W, :]
         x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -412,7 +412,7 @@ class LocallyGroupedAttnRPEContext(nn.Module):
         attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+            x = x[:, :H, :W, :]
         x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -527,7 +527,7 @@ class GlobalSubSampleAttnRPEContext(nn.Module):
 
         x = attn.transpose(1, 2).reshape(B, Hp, Wp, C)
         if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+            x = x[:, :H, :W, :]
 
         x = x.reshape(B, N, C)
         x = self.proj(x)
@@ -608,7 +608,7 @@ class LocallyGroupedAttnRPE(nn.Module):
         attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+            x = x[:, :H, :W, :]
         x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -704,7 +704,7 @@ class GlobalSubSampleAttnRPE(nn.Module):
 
         x = attn.transpose(1, 2).reshape(B, Hp, Wp, C)
         if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+            x = x[:, :H, :W, :]
 
         x = x.reshape(B, N, C)
         x = self.proj(x)
@@ -842,7 +842,7 @@ class LocallyGroupedAttn(nn.Module):
         attn = attn.transpose(2, 3).reshape(B, _h, _w, self.ws, self.ws, C)
         x = attn.transpose(2, 3).reshape(B, _h * self.ws, _w * self.ws, C)
         if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+            x = x[:, :H, :W, :]
         x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -1257,7 +1257,7 @@ class Twins(nn.Module):
                 if j == 0:
                     x = pos_blk(x, size)  # PEG here
             if i < len(self.depths) - 1:
-                x = x.reshape(B, *size, -1).permute(0, 3, 1, 2).contiguous()
+                x = x.reshape(B, *size, -1).permute(0, 3, 1, 2)
         x = self.norm(x)
         return x.mean(dim=1)  # GAP here
 
