@@ -76,9 +76,10 @@ class BidirCorrBlock:
 
         out = torch.cat(out_pyramid, dim=-1)
         out_T = torch.cat(out_pyramid_T, dim=-1)
+        dtype = self.corr_pyramid[0].dtype
         return (
-            out.permute(0, 3, 1, 2),
-            out_T.permute(0, 3, 1, 2),
+            out.permute(0, 3, 1, 2).to(dtype=dtype),
+            out_T.permute(0, 3, 1, 2).to(dtype=dtype),
         )
 
     @staticmethod
@@ -164,7 +165,8 @@ class CorrBlock:
             out_pyramid.append(corr)
 
         out = torch.cat(out_pyramid, dim=-1)
-        return out.permute(0, 3, 1, 2)
+        dtype = self.corr_pyramid[0].dtype
+        return out.permute(0, 3, 1, 2).to(dtype=dtype)
 
     @staticmethod
     def corr(fmap1, fmap2):

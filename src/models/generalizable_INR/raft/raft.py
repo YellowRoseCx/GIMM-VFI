@@ -77,8 +77,8 @@ class RAFT(nn.Module):
     def initialize_flow(self, img):
         """Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
         N, C, H, W = img.shape
-        coords0 = coords_grid(N, H // 8, W // 8, device=img.device)
-        coords1 = coords_grid(N, H // 8, W // 8, device=img.device)
+        coords0 = coords_grid(N, H // 8, W // 8, device=img.device).to(img.dtype)
+        coords1 = coords_grid(N, H // 8, W // 8, device=img.device).to(img.dtype)
 
         # optical flow computed as difference: flow = coords1 - coords0
         return coords0, coords1
