@@ -51,50 +51,58 @@ def _triton_corr_forward_kernel(
 
     for iy_out in range(rd):
         for ix_out in range(rd):
-            # The 4 points to gather from:
-            h2_sw_se = y0 - r + iy_out
-            h2_nw_ne = y0 - r + iy_out + 1
+            # Gather points:
+            # The destination pixel in the window is conceptually centered at (x0, y0) with offset (ix_out - r, iy_out - r)
+            # Its coordinates are h2 = y0 - r + iy_out, w2 = x0 - r + ix_out
 
-            w2_ne_se = x0 - r + ix_out
-            w2_nw_sw = x0 - r + ix_out + 1
+            # The 4 neighboring pixels in the original image for bilinear interpolation:
+            h2_nw_ne = y0 - r + iy_out       # North (top)
+            h2_sw_se = y0 - r + iy_out + 1   # South (bottom)
+
+            w2_nw_sw = x0 - r + ix_out       # West (left)
+            w2_ne_se = x0 - r + ix_out + 1   # East (right)
 
             val = tl.zeros([BLOCK_SIZE_HW], dtype=tl.float32)
 
-            # nw
+            # nw (top-left)
+            # weight = (1 - dy) * (1 - dx)
             mask_nw = (h2_nw_ne >= 0) & (h2_nw_ne < H2) & (w2_nw_sw >= 0) & (w2_nw_sw < W2)
             mask_nw_2d = mask_nw[:, None] & mask_2d
 
             f2_ptrs_nw = fmap2_ptr + pid_b * b_stride_f2 + h2_nw_ne[:, None] * h_stride_f2 + w2_nw_sw[:, None] * w_stride_f2 + c_offsets[None, :] * c_stride_f2
             f2_nw = tl.load(f2_ptrs_nw, mask=mask_nw_2d, other=0.0)
             s_nw = tl.sum(f1 * f2_nw, axis=1)
-            val += tl.where(mask_nw, s_nw * dy * dx, 0.0)
+            val += tl.where(mask_nw, s_nw * (1.0 - dy) * (1.0 - dx), 0.0)
 
-            # ne
+            # ne (top-right)
+            # weight = (1 - dy) * dx
             mask_ne = (h2_nw_ne >= 0) & (h2_nw_ne < H2) & (w2_ne_se >= 0) & (w2_ne_se < W2)
             mask_ne_2d = mask_ne[:, None] & mask_2d
 
             f2_ptrs_ne = fmap2_ptr + pid_b * b_stride_f2 + h2_nw_ne[:, None] * h_stride_f2 + w2_ne_se[:, None] * w_stride_f2 + c_offsets[None, :] * c_stride_f2
             f2_ne = tl.load(f2_ptrs_ne, mask=mask_ne_2d, other=0.0)
             s_ne = tl.sum(f1 * f2_ne, axis=1)
-            val += tl.where(mask_ne, s_ne * dy * (1.0 - dx), 0.0)
+            val += tl.where(mask_ne, s_ne * (1.0 - dy) * dx, 0.0)
 
-            # sw
+            # sw (bottom-left)
+            # weight = dy * (1 - dx)
             mask_sw = (h2_sw_se >= 0) & (h2_sw_se < H2) & (w2_nw_sw >= 0) & (w2_nw_sw < W2)
             mask_sw_2d = mask_sw[:, None] & mask_2d
 
             f2_ptrs_sw = fmap2_ptr + pid_b * b_stride_f2 + h2_sw_se[:, None] * h_stride_f2 + w2_nw_sw[:, None] * w_stride_f2 + c_offsets[None, :] * c_stride_f2
             f2_sw = tl.load(f2_ptrs_sw, mask=mask_sw_2d, other=0.0)
             s_sw = tl.sum(f1 * f2_sw, axis=1)
-            val += tl.where(mask_sw, s_sw * (1.0 - dy) * dx, 0.0)
+            val += tl.where(mask_sw, s_sw * dy * (1.0 - dx), 0.0)
 
-            # se
+            # se (bottom-right)
+            # weight = dy * dx
             mask_se = (h2_sw_se >= 0) & (h2_sw_se < H2) & (w2_ne_se >= 0) & (w2_ne_se < W2)
             mask_se_2d = mask_se[:, None] & mask_2d
 
             f2_ptrs_se = fmap2_ptr + pid_b * b_stride_f2 + h2_sw_se[:, None] * h_stride_f2 + w2_ne_se[:, None] * w_stride_f2 + c_offsets[None, :] * c_stride_f2
             f2_se = tl.load(f2_ptrs_se, mask=mask_se_2d, other=0.0)
             s_se = tl.sum(f1 * f2_se, axis=1)
-            val += tl.where(mask_se, s_se * (1.0 - dy) * (1.0 - dx), 0.0)
+            val += tl.where(mask_se, s_se * dy * dx, 0.0)
 
             # Write to output
             out_idx = iy_out + rd * ix_out
